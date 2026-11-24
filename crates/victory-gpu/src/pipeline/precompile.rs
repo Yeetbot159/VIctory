@@ -134,33 +134,12 @@ pub fn precompile(
     // Workers pull lines off one cursor: a line's driver compile is seconds
     // long, and the runtime itself makes pipelines on several threads, so one
     // line at a time would take two hours over the world's ~1,950.
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let jobs = jobs.clamp(1, 16);
-    let reports = std::sync::Mutex::new(Vec::with_capacity(jobs));
-    std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            scope.spawn(|| {
-                let mut report = Report::default();
-                let mut since_save = 0usize;
-                while let Some(at) = (next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                    .lt(&lines.len())
-                    .then(|| next.load(std::sync::atomic::Ordering::Relaxed) - 1)
-                {
-                    replay(lines[at], shaders, &mut report);
-                    since_save += 1;
-                    if since_save >= save_every {
-                        // Saved as it goes: 1,950 pipelines are more than one
-                        // session's worth of driver time, and a run that is
-                        // killed must keep what it stored.
-                        library::save(true);
-                        since_save = 0;
-                    }
-                }
-                reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
-            });
-        }
+    let reports = std::sync::Mutex::new(Vec::new());
+    replay_all(jobs, lines.len(), |at| {
+        let mut report = Report::default();
+        replay(lines[at], shaders, &mut report);
+        reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
     });
-    library::save(true);
     let mut report = Report {
         before,
         after: library::BLOB.load(std::sync::atomic::Ordering::Relaxed),
@@ -177,6 +156,30 @@ pub fn precompile(
         report.refused += one.refused;
     }
     Ok(report)
+}
+
+/// Hands each line index to `work` exactly once, on `jobs` threads.
+fn replay_all(jobs: usize, lines: usize, work: impl Fn(usize) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.clamp(1, 16) {
+            scope.spawn(|| {
+                while let Some(at) = claim(&next, lines) {
+                    work(at);
+                }
+            });
+        }
+    });
+}
+
+/// The next line no worker has claimed, or `None` when every line has one.
+///
+/// The index the claim took is the index the worker replays: reading the cursor
+/// again instead hands two workers the same line, loses others, and at the tail
+/// returns an index one past the end.
+fn claim(next: &std::sync::atomic::AtomicUsize, len: usize) -> Option<usize> {
+    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (at < len).then_some(at)
 }
 
 /// Replays one dump line into the library, counting what became of it.
@@ -274,6 +277,56 @@ fn parse(line: &str) -> Option<(&str, Option<Vec<(&str, String)>>, Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line is replayed once and once only, however many workers there
+    /// are: the index a claim takes is the index the worker replays. Reading the
+    /// cursor a second time instead hands two workers the same line, loses
+    /// others, and at the tail returns one past the end, which panics inside
+    /// `std::thread::scope` and ends a replay before its final save.
+    ///
+    /// The body takes time, because that is what makes the window wider than a
+    /// few instructions: with an empty body eight threads pass the cursor back
+    /// and forth so quickly that a second read almost always sees the value the
+    /// claim just left. A replay's body compiles a shader for seconds, and the
+    /// same collision then happens about once in 8,000 claims.
+    #[test]
+    fn every_line_is_claimed_once_by_however_many_workers() {
+        const LINES: usize = 300;
+        const PASSES: usize = 200;
+        for jobs in [2usize, 3, 8] {
+            for pass in 0..PASSES {
+                let visits: Vec<std::sync::atomic::AtomicUsize> =
+                    (0..LINES).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+                let past = std::sync::atomic::AtomicUsize::new(0);
+                replay_all(jobs, LINES, |at| {
+                    // The shape of a replay's body: enough work that this thread
+                    // is not holding the cursor's cache line throughout.
+                    let mut spin = 0u64;
+                    for i in 0..2_000u64 {
+                        spin = spin.wrapping_add(i ^ at as u64);
+                    }
+                    std::hint::black_box(spin);
+                    match visits.get(at) {
+                        Some(seen) => {
+                            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        None => {
+                            past.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    };
+                });
+                assert_eq!(
+                    past.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "{jobs} workers were handed a line past the end, pass {pass}"
+                );
+                let wrong = (0..LINES)
+                    .filter(|&i| visits[i].load(std::sync::atomic::Ordering::Relaxed) != 1)
+                    .count();
+                assert_eq!(wrong, 0, "{jobs} workers: {wrong} lines unclaimed or claimed twice, pass {pass}");
+            }
+        }
+    }
 
     #[test]
     fn a_line_is_its_kind_its_stages_and_its_state() {

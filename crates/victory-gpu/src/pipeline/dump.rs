@@ -67,13 +67,21 @@ pub(crate) fn record(shaders: &[(String, String)], state: Option<&GraphicsState>
         .join(",");
     let fields = state.map(GraphicsState::fields).unwrap_or_else(|| "-".into());
     let line = format!("kind={layout} stages={stages} state={fields}");
-    if !seen().lock().unwrap_or_else(|e| e.into_inner()).insert(line.clone()) {
+    // Under the lock, and in one write: a second process on the same dump (the
+    // title relaunches itself, and the audio capture child has the environment
+    // too) appends to the same file with its own set, so a write that is not one
+    // call can land inside another process's line. A torn line is a dump line
+    // `precompile` refuses, and a refused line is a pipeline nobody compiles.
+    let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.insert(line.clone()) {
         return;
     }
     // Appended, not rewritten: a run that dies mid-frame still leaves every
     // pipeline it had reached, and two runs accumulate.
+    let mut bytes = line.into_bytes();
+    bytes.push(0x0a);
     if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        if let Err(e) = writeln!(out, "{line}") {
+        if let Err(e) = out.write_all(&bytes) {
             tracing::warn!(error = %e, "host pipeline dump not written");
         }
     }
