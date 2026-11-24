@@ -770,7 +770,7 @@ mod bits {
     }
 
     /// Records one descriptor's words. `kind` names the entry (srv, uav, cbv).
-    pub(super) fn record(kind: &str, words: &[u32]) {
+    pub(super) fn record(kind: &str, words: &[u32], handle: u64) {
         if !on() {
             return;
         }
@@ -785,6 +785,7 @@ mod bits {
             tracing::info!(
                 kind,
                 total,
+                slot = format_args!("{handle:#x}"),
                 bit28 = u8::from(set),
                 low10 = format_args!("{:#x}", hi & 0x3ff),
                 word1 = format_args!("{hi:#010x}"),
@@ -812,7 +813,7 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some(w @ [lo, hi, size, _]) = words(desc) {
-        bits::record("cbv", &w);
+        bits::record("cbv", &w, handle);
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
     }
@@ -827,7 +828,7 @@ pub(crate) extern "system" fn create_srv(
 ) {
     let words = words(desc);
     if let Some(w) = &words {
-        bits::record("srv", w);
+        bits::record("srv", w, handle);
     }
     record(handle, View::Shader(resource as usize, words));
 }
@@ -842,7 +843,7 @@ pub(crate) extern "system" fn create_uav(
 ) {
     let words = words(desc);
     if let Some(w) = &words {
-        bits::record("uav", w);
+        bits::record("uav", w, handle);
     }
     let view = View::Unordered(resource as usize, counter as usize, words);
     record(handle, view);
