@@ -3437,7 +3437,7 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let (src, uav, props, image) = if let Some((at, first)) = use_at {
+        let (first, used, uav, props, image) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
@@ -3475,49 +3475,32 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
-                Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
-                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                        return Err("a constant buffer's descriptor read as data");
-                    }
-                    ((11 | u, 0), None)
-                }
                 _ => return Err("a scalar memory read as data"),
             };
-            (src, uav, props, image)
+            (first, used, uav, props, image)
         } else {
-            // If no resource instruction names this descriptor, infer its kind
-            // from the table range and descriptor width. GPU heap entries not
-            // covered by a declared range are treated as 2D images when they
-            // contain eight dwords, or raw/structured buffers when they have
-            // four. Other descriptor shapes need an actual use to disambiguate.
-            const NONE: Why = "a descriptor read only as data";
             let src = Source::Loaded { load: site, first: 0 };
-            let used = self.used_kind(&src);
-            let in_views = self
-                .scalar
-                .get(&site)
-                .and_then(|a| self.x.native.layout.get(a.param))
-                .is_some_and(|rp| matches!(rp.root, RootType::Table | RootType::ResourceHeap));
-            let (uav, dwords, stride) = match used {
-                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
-                    (u.kind == ResourceType::Uav, u.dwords, u.stride)
-                }
-                None if in_views => (false, count as u8, 0),
-                _ => return Err(NONE),
+            let Some(used) = self.used_kind(&src).filter(|u| u.dwords == 4) else {
+                return Err("a descriptor read only as data");
             };
-            let u = if uav { 0x1000 } else { 0 };
-            match dwords {
-                8 => (src, uav, (2 | u, 0x409), Some(2)),
-                4 if stride >= 4 && stride.is_multiple_of(4) => {
-                    (src, uav, (12 | u, stride), None)
+            match used.kind {
+                ResourceType::Cbv => return Err("a constant buffer's descriptor read as data"),
+                ResourceType::Sampler | ResourceType::Other(_) => {
+                    return Err("a descriptor read only as data")
                 }
-                4 if used.is_some() => (src, uav, (11 | u, 0), None),
-                _ => return Err(NONE),
+                ResourceType::Srv | ResourceType::Uav => {}
             }
+            let uav = used.kind == ResourceType::Uav;
+            let u = if uav { 0x1000 } else { 0 };
+            let props = if used.stride >= 4 && used.stride.is_multiple_of(4) {
+                (12 | u, used.stride)
+            } else {
+                (11 | u, 0)
+            };
+            (0, Some(used), uav, props, None)
         };
-        let Source::Loaded { first, .. } = src else {
-            unreachable!()
-        };
+        let src = Source::Loaded { load: site, first };
+        let _ = used;
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -8794,6 +8777,34 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn buffer_descriptor_size_read_without_buffer_op_lowers() {
+        // A 4-dword SRV buffer descriptor loaded from a table whose size word
+        // (`s10`, word 2) is read directly without any `buffer_*` instruction.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
