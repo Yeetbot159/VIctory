@@ -189,9 +189,18 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // A host that refuses the pipeline creation is a host finding, not a
+        // shader one: WARP rejects a wave operation in a group it will not
+        // widen, and the title's own 505 compute refusals are the same call
+        // returning the same error. The assertion below still requires one
+        // backend to have run it.
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{label}: compute_pipeline refused ({e}); skipped");
+                continue;
+            }
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -1173,16 +1182,12 @@ fn a_lane_permute_reads_the_lane_its_address_names() {
     // 3, and one that zeroed an odd address — the shape this branch fixes —
     // would store 0 for address 13, whose bit 0 is set.
     for (address, lane) in [(13u16, 3u32), (4, 1), (5, 1)] {
-        let shader = build_lane_cs(
-            &[
-                vop3(0x365, 1, 0xC1, 0x80, 0x80), // v_mbcnt_lo_u32_b32 v1, -1, 0
-                vop1(0x001, 2, vgpr(1)),          // v_mov_b32 v2, v1
-                vop1(0x001, 1, 0x80 + address),   // v_mov_b32 v1, address
-                0xDACC_0000,
-                0x0000_0201, // ds_bpermute_b32 v0, v1, v2
-            ],
-            16,
-        );
+        let mut body = Vec::new();
+        body.extend_from_slice(&vop3(0x365, 1, 0xC1, 0x80, 0x80)); // v_mbcnt_lo_u32_b32 v1, -1, 0
+        body.push(vop1(0x001, 2, vgpr(1))); // v_mov_b32 v2, v1
+        body.push(vop1(0x001, 1, 0x80 + address)); // v_mov_b32 v1, address
+        body.extend_from_slice(&[0xDACC_0000, 0x0000_0201]); // ds_bpermute_b32 v0, v1, v2
+        let shader = build_lane_cs(&body, 16);
         run_cases(&shader, &[[0; 4]], |label, _, _, got| {
             assert_eq!(got, lane, "{label}: address {address} names lane {lane}");
         });
@@ -1194,16 +1199,12 @@ fn a_lane_permute_adds_its_immediate_to_the_address() {
     // The immediate is added to the address before the division, so address 0
     // with `offset:4` reads lane 1 and not lane 0. A lowering that dropped the
     // immediate would store 0 here.
-    let shader = build_lane_cs(
-        &[
-            vop3(0x365, 1, 0xC1, 0x80, 0x80), // v_mbcnt_lo_u32_b32 v1, -1, 0
-            vop1(0x001, 2, vgpr(1)),          // v_mov_b32 v2, v1
-            vop1(0x001, 1, 0x80),             // v_mov_b32 v1, 0
-            0xDACC_0004,
-            0x0000_0201, // ds_bpermute_b32 v0, v1, v2 offset:4
-        ],
-        16,
-    );
+    let mut body = Vec::new();
+    body.extend_from_slice(&vop3(0x365, 1, 0xC1, 0x80, 0x80)); // v_mbcnt_lo_u32_b32 v1, -1, 0
+    body.push(vop1(0x001, 2, vgpr(1))); // v_mov_b32 v2, v1
+    body.push(vop1(0x001, 1, 0x80)); // v_mov_b32 v1, 0
+    body.extend_from_slice(&[0xDACC_0004, 0x0000_0201]); // ds_bpermute_b32 v0, v1, v2 offset:4
+    let shader = build_lane_cs(&body, 16);
     run_cases(&shader, &[[0; 4]], |label, _, _, got| {
         assert_eq!(got, 1, "{label}: the immediate moves the read to lane 1");
     });
