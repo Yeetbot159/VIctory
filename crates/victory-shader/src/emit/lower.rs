@@ -5503,6 +5503,14 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let mask = if self.x.native.wave64 { 63 } else { 31 };
+                let lane = match lane {
+                    V::Const(k) => self.s.m.i32(k & mask),
+                    _ => {
+                        let m = self.s.m.i32(mask);
+                        self.s.m.bin(c, Bin::And, lane, m)
+                    }
+                };
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -5517,8 +5525,17 @@ impl<'a> Lower<'a> {
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
-                // On RDNA2 `v_writelane_b32` ignores `EXEC`, so write unconditionally.
+                // RDNA2 ignores EXEC for v_writelane_b32 so compilers can spill
+                // SGPRs into inactive lanes.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let mask = if self.x.native.wave64 { 63 } else { 31 };
+                let lane = match lane {
+                    V::Const(k) => self.s.m.i32(k & mask),
+                    _ => {
+                        let m = self.s.m.i32(mask);
+                        self.s.m.bin(c, Bin::And, lane, m)
+                    }
+                };
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -5542,7 +5559,8 @@ impl<'a> Lower<'a> {
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                self.write_i(inst, r, None)
+                self.write(inst, Reg::V(reg), r, None);
+                Ok(())
             }
             "v_readfirstlane_b32"
                 if inst
@@ -9000,6 +9018,30 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn v_readlane_and_writelane_mask_lane_and_ignore_exec() {
+        // v_writelane_b32 under narrowed EXEC ignores EXEC and writes target lane.
+        // v_readlane_b32 with lane > 31 masks to lane & 31.
+        let words = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBEFE_0380, // s_mov_b32 exec_lo, 0
+            0xD761_0000,
+            0x0001_0000, // v_writelane_b32 v0, s0, 0 (VOP3 0x361)
+            0xD760_0000,
+            0x0001_5100, // v_readlane_b32 s0, v0, 40 (lane 40 inline const 168) (VOP3 0x360)
+            S_ENDPGM,
+        ];
+        let layout = || vec![];
+        let used = || vec![];
+        let l = lower_with(&words, layout(), used()).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone()).unwrap();
+        }
     }
 
     #[test]
