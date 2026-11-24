@@ -745,6 +745,61 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// `VICTORY_DESCRIPTOR_BITS=1`: log the console descriptor words the title sets,
+/// so the emitter's guess about which arm of a `dword1 & 0x10000000` guard a
+/// program takes can be replaced by what the title actually writes.
+///
+/// Bit 28 of word 1 selects between two descriptor layouts, not a flag: with it
+/// set the low ten bits are a table index, with it clear they are address bits.
+/// On the host word 1 carries a host address, so the bit is always clear and the
+/// indexed arm is dead. What this records is whether the title ever sets it.
+mod bits {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static SET: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        *ON.get_or_init(|| matches!(
+            std::env::var("VICTORY_DESCRIPTOR_BITS").as_deref(),
+            Ok("1") | Ok("true")
+        ))
+    }
+
+    /// Records one descriptor's words. `kind` names the entry (srv, uav, cbv).
+    pub(super) fn record(kind: &str, words: &[u32]) {
+        if !on() {
+            return;
+        }
+        let hi = words.get(1).copied().unwrap_or(0);
+        let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let set = hi & 0x1000_0000 != 0;
+        let sets = SET.fetch_add(u64::from(set), Ordering::Relaxed) + u64::from(set);
+        if SAMPLES.fetch_add(1, Ordering::Relaxed) < 64 {
+            tracing::info!(
+                kind,
+                total,
+                bit28 = u8::from(set),
+                low10 = format_args!("{:#x}", hi & 0x3ff),
+                word1 = format_args!("{hi:#010x}"),
+                word3 = format_args!("{:#010x}", words.get(3).copied().unwrap_or(0)),
+                "descriptor words"
+            );
+        }
+        if total % 4096 == 0 {
+            tracing::info!(
+                kind,
+                total,
+                bit28_set = sets,
+                "descriptor words so far: bit 28 of word 1"
+            );
+        }
+    }
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.
@@ -753,7 +808,8 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
+    if let Some(w @ [lo, hi, size, _]) = words(desc) {
+        bits::record("cbv", &w);
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
     }
@@ -766,7 +822,11 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    record(handle, View::Shader(resource as usize, words(desc)));
+    let words = words(desc);
+    if let Some(w) = &words {
+        bits::record("srv", w);
+    }
+    record(handle, View::Shader(resource as usize, words));
 }
 
 /// Device method.
@@ -777,7 +837,11 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
+    let words = words(desc);
+    if let Some(w) = &words {
+        bits::record("uav", w);
+    }
+    let view = View::Unordered(resource as usize, counter as usize, words);
     record(handle, view);
 }
 
