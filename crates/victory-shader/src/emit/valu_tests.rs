@@ -1154,3 +1154,29 @@ fn a_buffer_reached_through_a_pointer_loaded_from_the_constants() {
         assert_eq!(out[0][0], target[0], "{label}: the chased dword");
     }
 }
+
+#[test]
+fn a_lane_permute_lowers_and_validates() {
+    // `ds_bpermute_b32` addresses the source lane with a byte address in a
+    // VGPR, so the address is divided by four and its low two bits take no
+    // part. Only the lowering is pinned here: the group of this harness is
+    // one thread, and a host pipeline of one thread rejects a wave operation
+    // (`E_INVALIDARG` from `CreateComputePipelineState`), so the permuted
+    // value needs a group of more than one.
+    build_valu_cs(&[
+        0xDACC_0000,
+        0x0000_0201, // ds_bpermute_b32 v0, v1, v2
+    ]);
+}
+
+#[test]
+fn a_lane_permute_adds_its_immediate_to_the_address() {
+    // The immediate is added to the address before the division. One thread
+    // cannot be permuted to, so this pins that the form lowers at all: an
+    // offset the lowering dropped would read a different lane of a group of
+    // more than one.
+    build_valu_cs(&[
+        0xDACC_0010,
+        0x0000_0201, // ds_bpermute_b32 v0, v1, v2 offset:0x10
+    ]);
+}
