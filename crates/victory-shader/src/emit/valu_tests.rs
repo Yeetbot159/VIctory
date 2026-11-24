@@ -967,68 +967,102 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
-fn float_compares_that_are_always_false_or_true() {
-    let cmp_shader = |op: u16| {
-        let cmp = vop3(op, 6, vgpr(1), vgpr(2), 0);
+fn v_cmp_class_f32_matches_rdna2() {
+    let build_mod = |abs0: bool, neg0: bool| {
+        let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+        if abs0 {
+            w0 |= 1 << 8;
+        }
+        if neg0 {
+            w1 |= 1 << 29;
+        }
         let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
-        build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]])
+        build_valu_cs(&[w0, w1, sel[0], sel[1]])
     };
-    let cmpx_shader = |op: u16| {
-        let vopc = 0x7C00_0000 | (op as u32) << 17 | 2 << 9 | vgpr(1) as u32;
-        build_valu_cs(&[
-            s_mov_b32(6, 0x7E),   // s_mov_b32 s6, exec_lo
-            vop1(0x001, 0, 0x80), // v_mov_b32 v0, 0
-            vopc,                 // v_cmpx_* exec_lo, v1, v2
-            vop1(0x001, 0, 0x81), // v_mov_b32 v0, 1 (guarded by narrowed EXEC)
-            s_mov_b32(0x7E, 6),   // s_mov_b32 exec_lo, s6
-        ])
+    let plain = build_mod(false, false);
+    let neg = build_mod(false, true);
+    let abs = build_mod(true, false);
+    let abs_neg = build_mod(true, true);
+
+    // SDWA: v_cmp_class_f32_sdwa s6, -v1, v2 src0_sel:WORD_0 src1_sel:DWORD.
+    // Zero-extending WORD_0 of 0xDEAD_0001 yields +denormal 0x0000_0001;
+    // bitwise `neg` must flip bit 31 to -denormal 0x8000_0001 (class 4),
+    // not flush under FTZ to -0.0 (class 5).
+    let sdwa_w0 = 0x7C00_0000 | 0x088 << 17 | 2 << 9 | 0xF9;
+    let sdwa_ext = 1 | 6 << 8 | 1 << 15 | 4 << 16 | 1 << 20 | 6 << 24;
+    let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    let sdwa_word0_neg = build_valu_cs(&[sdwa_w0, sdwa_ext, sel[0], sel[1]]);
+
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN (quiet bit 0x0040_0000 clear)
+        (0xFFBF_FFFF, 0), // -sNaN
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFC0_0001, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0xBF80_0000, 3), // -normal (-1.0)
+        (0x8000_0001, 4), // -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // +denormal
+        (0x3F80_0000, 8), // +normal (+1.0)
+        (0x7F80_0000, 9), // +inf
+    ];
+    let classify = |bits: u32| -> u32 {
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x007F_FFFF;
+        let sign = bits >> 31;
+        if exp == 0xFF && mant != 0 {
+            u32::from(mant & 0x0040_0000 != 0)
+        } else {
+            let pos = if exp == 0xFF {
+                9
+            } else if exp == 0 {
+                if mant == 0 { 6 } else { 7 }
+            } else {
+                8
+            };
+            if sign != 0 { 11 - pos } else { pos }
+        }
     };
 
-    let f32_inputs: &[[u32; 4]] = &[
-        [0.0f32.to_bits(), 0.0f32.to_bits(), 0, 0],
-        [(-0.0f32).to_bits(), 1.0f32.to_bits(), 0, 0],
-        [(-2.5f32).to_bits(), 3.75f32.to_bits(), 0, 0],
-        [f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0, 0],
-        [0x7FC0_0000, 1.0f32.to_bits(), 0, 0], // qNaN
-        [0x7F80_0001, 0xFF80_0001, 0, 0],      // +sNaN, -sNaN
-    ];
-    let f16_inputs: &[[u32; 4]] = &[
-        [0x0000, 0x8000, 0, 0], // +0.0, -0.0
-        [0x3C00, 0xBC00, 0, 0], // +1.0, -1.0
-        [0x7C00, 0xFC00, 0, 0], // +inf, -inf
-        [0x7E00, 0x3C00, 0, 0], // qNaN, +1.0
-        [0x7C01, 0xFC01, 0, 0], // +sNaN, -sNaN
-    ];
-
-    for (name, op, want, inputs) in [
-        ("v_cmp_f_f32", 0x000, 0u32, f32_inputs),
-        ("v_cmp_tru_f32", 0x00f, 1u32, f32_inputs),
-        ("v_cmp_f_f16", 0x0c8, 0u32, f16_inputs),
-        ("v_cmp_tru_f16", 0x0ef, 1u32, f16_inputs),
+    for (label, cs, xform) in [
+        ("plain", &plain, (|b: u32| b) as fn(u32) -> u32),
+        ("neg", &neg, |b| b ^ 0x8000_0000),
+        ("abs", &abs, |b| b & 0x7FFF_FFFF),
+        ("abs+neg", &abs_neg, |b| (b & 0x7FFF_FFFF) ^ 0x8000_0000),
     ] {
-        let cs = cmp_shader(op);
-        run_cases(&cs, inputs, |backend, _, inp, got| {
+        let mut cases = Vec::new();
+        for &(bits, base_cls) in classes {
+            if label == "plain" {
+                assert_eq!(classify(bits), base_cls);
+            }
+            let cls = classify(xform(bits));
+            cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+            cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+        }
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(cs, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
             assert_eq!(
                 got, want,
-                "{backend}: {name}({:#010x}, {:#010x}) = {got}, want {want}",
+                "{backend}: v_cmp_class_f32[{label}]({:#010x}, {:#05x}) = {got}, want {want}",
                 inp[0], inp[1],
             );
         });
     }
 
-    for (name, op, want, inputs) in [
-        ("v_cmpx_f_f32", 0x010, 0u32, f32_inputs),
-        ("v_cmpx_tru_f32", 0x01f, 1u32, f32_inputs),
-        ("v_cmpx_f_f16", 0x0d8, 0u32, f16_inputs),
-        ("v_cmpx_tru_f16", 0x0ff, 1u32, f16_inputs),
-    ] {
-        let cs = cmpx_shader(op);
-        run_cases(&cs, inputs, |backend, _, inp, got| {
-            assert_eq!(
-                got, want,
-                "{backend}: {name}({:#010x}, {:#010x}) = {got}, want {want}",
-                inp[0], inp[1],
-            );
-        });
-    }
+    let sdwa_cases: &[([u32; 4], u32)] = &[
+        ([0xDEAD_0001, 1 << 4, 0, 0], 1), // -denormal
+        ([0xDEAD_0001, 1 << 5, 0, 0], 0), // must not flush to -0.0
+        ([0xBEEF_0000, 1 << 5, 0, 0], 1), // -0.0
+    ];
+    let sdwa_in: Vec<[u32; 4]> = sdwa_cases.iter().map(|c| c.0).collect();
+    run_cases(&sdwa_word0_neg, &sdwa_in, |backend, i, inp, got| {
+        let want = sdwa_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32_sdwa(-word0({:#010x}), {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
 }
