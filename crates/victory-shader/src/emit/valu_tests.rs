@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_lane_cs(body, 1)
+}
+
+/// The same with a group of `threads` threads, so a wave operation has lanes
+/// to permute between.
+fn build_lane_cs(body: &[u32], threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +123,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -1156,27 +1162,49 @@ fn a_buffer_reached_through_a_pointer_loaded_from_the_constants() {
 }
 
 #[test]
-fn a_lane_permute_lowers_and_validates() {
-    // `ds_bpermute_b32` addresses the source lane with a byte address in a
-    // VGPR, so the address is divided by four and its low two bits take no
-    // part. Only the lowering is pinned here: the group of this harness is
-    // one thread, and a host pipeline of one thread rejects a wave operation
-    // (`E_INVALIDARG` from `CreateComputePipelineState`), so the permuted
-    // value needs a group of more than one.
-    build_valu_cs(&[
-        0xDACC_0000,
-        0x0000_0201, // ds_bpermute_b32 v0, v1, v2
-    ]);
+fn a_lane_permute_reads_the_lane_its_address_names() {
+    // `ds_bpermute_b32` names the source lane with a byte address, so lane 13
+    // addresses is lane 3: the address is divided by four and its low two
+    // bits take no part. Sixteen lanes give the permute somewhere to read
+    // from, and every lane stores the same value, so the dword the UAV holds
+    // is the permitted one whichever lane's store lands last.
+    //
+    // A lowering that skipped the division would read lane 13 instead of lane
+    // 3, and one that zeroed an odd address — the shape this branch fixes —
+    // would store 0 for address 13, whose bit 0 is set.
+    for (address, lane) in [(13u16, 3u32), (4, 1), (5, 1)] {
+        let shader = build_lane_cs(
+            &[
+                vop3(0x365, 1, 0xC1, 0x80, 0x80), // v_mbcnt_lo_u32_b32 v1, -1, 0
+                vop1(0x001, 2, vgpr(1)),          // v_mov_b32 v2, v1
+                vop1(0x001, 1, 0x80 + address),   // v_mov_b32 v1, address
+                0xDACC_0000,
+                0x0000_0201, // ds_bpermute_b32 v0, v1, v2
+            ],
+            16,
+        );
+        run_cases(&shader, &[[0; 4]], |label, _, _, got| {
+            assert_eq!(got, lane, "{label}: address {address} names lane {lane}");
+        });
+    }
 }
 
 #[test]
 fn a_lane_permute_adds_its_immediate_to_the_address() {
-    // The immediate is added to the address before the division. One thread
-    // cannot be permuted to, so this pins that the form lowers at all: an
-    // offset the lowering dropped would read a different lane of a group of
-    // more than one.
-    build_valu_cs(&[
-        0xDACC_0010,
-        0x0000_0201, // ds_bpermute_b32 v0, v1, v2 offset:0x10
-    ]);
+    // The immediate is added to the address before the division, so address 0
+    // with `offset:4` reads lane 1 and not lane 0. A lowering that dropped the
+    // immediate would store 0 here.
+    let shader = build_lane_cs(
+        &[
+            vop3(0x365, 1, 0xC1, 0x80, 0x80), // v_mbcnt_lo_u32_b32 v1, -1, 0
+            vop1(0x001, 2, vgpr(1)),          // v_mov_b32 v2, v1
+            vop1(0x001, 1, 0x80),             // v_mov_b32 v1, 0
+            0xDACC_0004,
+            0x0000_0201, // ds_bpermute_b32 v0, v1, v2 offset:4
+        ],
+        16,
+    );
+    run_cases(&shader, &[[0; 4]], |label, _, _, got| {
+        assert_eq!(got, 1, "{label}: the immediate moves the read to lane 1");
+    });
 }
