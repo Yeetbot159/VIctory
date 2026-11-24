@@ -2545,20 +2545,27 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Each lane reads the source of the lane its address names (a
-            // byte per lane), and an address with bit 0 set reads 0.
+            // Each lane reads the source of the lane its byte address names:
+            // the address plus the immediate, divided by 4, so its low two
+            // bits take no part. shortcut: the console also reads 0 from a
+            // source lane its EXEC mask clears, and the emitter no longer has
+            // a per-lane mask to test, so the host reads that lane's value;
+            // and an address past the wave wraps mod 64 on the console, which
+            // only the AMD host reproduces.
             self.cross_lane(false)?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let reg = dst_reg.ok_or("a permute result")?;
+            let at = match offset {
+                0 => a,
+                k => {
+                    let k = self.s.m.i32(k);
+                    self.s.m.bin(c, Bin::Add, a, k)
+                }
+            };
             let two = self.s.m.i32(2);
-            let lane = self.s.m.bin(c, Bin::LShr, a, two);
+            let lane = self.s.m.bin(c, Bin::LShr, at, two);
             let r = self.read_lane(x, lane);
-            let one = self.s.m.i32(1);
-            let odd = self.s.m.bin(c, Bin::And, a, one);
-            let zero = self.s.m.i32(0);
-            let is_odd = self.s.m.cmp(c, pred::NE, odd, zero);
-            let r = self.s.m.select(c, is_odd, zero, r);
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
