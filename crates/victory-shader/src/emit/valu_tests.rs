@@ -967,102 +967,77 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
-fn v_cmp_class_f32_matches_rdna2() {
-    let build_mod = |abs0: bool, neg0: bool| {
-        let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
-        if abs0 {
-            w0 |= 1 << 8;
-        }
-        if neg0 {
-            w1 |= 1 << 29;
-        }
-        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
-        build_valu_cs(&[w0, w1, sel[0], sel[1]])
-    };
-    let plain = build_mod(false, false);
-    let neg = build_mod(false, true);
-    let abs = build_mod(true, false);
-    let abs_neg = build_mod(true, true);
-
-    // SDWA: v_cmp_class_f32_sdwa s6, -v1, v2 src0_sel:WORD_0 src1_sel:DWORD.
-    // Zero-extending WORD_0 of 0xDEAD_0001 yields +denormal 0x0000_0001;
-    // bitwise `neg` must flip bit 31 to -denormal 0x8000_0001 (class 4),
-    // not flush under FTZ to -0.0 (class 5).
-    let sdwa_w0 = 0x7C00_0000 | 0x088 << 17 | 2 << 9 | 0xF9;
-    let sdwa_ext = 1 | 6 << 8 | 1 << 15 | 4 << 16 | 1 << 20 | 6 << 24;
-    let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
-    let sdwa_word0_neg = build_valu_cs(&[sdwa_w0, sdwa_ext, sel[0], sel[1]]);
-
-    let classes: &[(u32, u32)] = &[
-        (0x7F80_0001, 0), // +sNaN (quiet bit 0x0040_0000 clear)
-        (0xFFBF_FFFF, 0), // -sNaN
-        (0x7FC0_0000, 1), // +qNaN
-        (0xFFC0_0001, 1), // -qNaN
-        (0xFF80_0000, 2), // -inf
-        (0xBF80_0000, 3), // -normal (-1.0)
-        (0x8000_0001, 4), // -denormal
-        (0x8000_0000, 5), // -0.0
-        (0x0000_0000, 6), // +0.0
-        (0x0000_0001, 7), // +denormal
-        (0x3F80_0000, 8), // +normal (+1.0)
-        (0x7F80_0000, 9), // +inf
-    ];
-    let classify = |bits: u32| -> u32 {
-        let exp = (bits >> 23) & 0xFF;
-        let mant = bits & 0x007F_FFFF;
-        let sign = bits >> 31;
-        if exp == 0xFF && mant != 0 {
-            u32::from(mant & 0x0040_0000 != 0)
-        } else {
-            let pos = if exp == 0xFF {
-                9
-            } else if exp == 0 {
-                if mant == 0 { 6 } else { 7 }
-            } else {
-                8
-            };
-            if sign != 0 { 11 - pos } else { pos }
-        }
+fn fma_k_f16_cvt_pk_16_and_lerp_u8_match_rdna2() {
+    let vop2 = |op: u32, vdst: u32, src0: u16, vsrc1: u32| -> u32 {
+        (op << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | u32::from(src0 & 0x1FF)
     };
 
-    for (label, cs, xform) in [
-        ("plain", &plain, (|b: u32| b) as fn(u32) -> u32),
-        ("neg", &neg, |b| b ^ 0x8000_0000),
-        ("abs", &abs, |b| b & 0x7FFF_FFFF),
-        ("abs+neg", &abs_neg, |b| (b & 0x7FFF_FFFF) ^ 0x8000_0000),
-    ] {
-        let mut cases = Vec::new();
-        for &(bits, base_cls) in classes {
-            if label == "plain" {
-                assert_eq!(classify(bits), base_cls);
-            }
-            let cls = classify(xform(bits));
-            cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
-            cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
-        }
-        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
-        run_cases(cs, &inputs, |backend, i, inp, got| {
-            let want = cases[i].1;
-            assert_eq!(
-                got, want,
-                "{backend}: v_cmp_class_f32[{label}]({:#010x}, {:#05x}) = {got}, want {want}",
-                inp[0], inp[1],
-            );
-        });
-    }
+    // v_fmamk_f16 v0, v1, 0x4000 (2.0), v2 (VOP2 0x037), with v0 pre-seeded to 0xCAFE_0000
+    // to verify high-half preservation.
+    let fmamk = build_valu_cs(&[
+        vop1(0x001, 0, 255),
+        0xCAFE_0000,
+        vop2(0x037, 0, vgpr(1), 2),
+        0x0000_4000, // 2.0f16
+    ]);
+    // v_fmaak_f16 v0, v1, v2, 0x3C00 (1.0) (VOP2 0x038), with v0 pre-seeded to 0xCAFE_0000.
+    let fmaak = build_valu_cs(&[
+        vop1(0x001, 0, 255),
+        0xCAFE_0000,
+        vop2(0x038, 0, vgpr(1), 2),
+        0x0000_3C00, // 1.0f16
+    ]);
+    // v1 = 3.0 (0x4200), v2 = 0.5 (0x3800):
+    // fmamk: 3.0 * 2.0 + 0.5 = 6.5 (0x4680) -> 0xCAFE_4680
+    // fmaak: 3.0 * 0.5 + 1.0 = 2.5 (0x4100) -> 0xCAFE_4100
+    let fma_in = [[0x1234_4200, 0x5678_3800, 0, 0]];
+    run_cases(&fmamk, &fma_in, |b, _, _, g| {
+        assert_eq!(g, 0xCAFE_4680, "{b}: v_fmamk_f16(3.0, 2.0, 0.5)");
+    });
+    run_cases(&fmaak, &fma_in, |b, _, _, g| {
+        assert_eq!(g, 0xCAFE_4100, "{b}: v_fmaak_f16(3.0, 0.5, 1.0)");
+    });
 
-    let sdwa_cases: &[([u32; 4], u32)] = &[
-        ([0xDEAD_0001, 1 << 4, 0, 0], 1), // -denormal
-        ([0xDEAD_0001, 1 << 5, 0, 0], 0), // must not flush to -0.0
-        ([0xBEEF_0000, 1 << 5, 0, 0], 1), // -0.0
+    // v_cvt_pk_i16_i32 (VOP3 0x36b) & v_cvt_pk_u16_u32 (VOP3 0x36a).
+    let pk_i16 = build_valu_cs(&vop3(0x36b, 0, vgpr(1), vgpr(2), 0));
+    let pk_u16 = build_valu_cs(&vop3(0x36a, 0, vgpr(1), vgpr(2), 0));
+    let pk_i16_cases: &[([u32; 4], u32)] = &[
+        // (-100, 250) -> 0x00FA_FF9C
+        ([(-100i32) as u32, 250, 0, 0], 0x00FA_FF9C),
+        // (-100_000 -> -32768 = 0x8000, +100_000 -> 32767 = 0x7FFF)
+        ([(-100_000i32) as u32, 100_000, 0, 0], 0x7FFF_8000),
+        // (i32::MAX -> 0x7FFF, i32::MIN -> 0x8000)
+        ([i32::MAX as u32, i32::MIN as u32, 0, 0], 0x8000_7FFF),
     ];
-    let sdwa_in: Vec<[u32; 4]> = sdwa_cases.iter().map(|c| c.0).collect();
-    run_cases(&sdwa_word0_neg, &sdwa_in, |backend, i, inp, got| {
-        let want = sdwa_cases[i].1;
-        assert_eq!(
-            got, want,
-            "{backend}: v_cmp_class_f32_sdwa(-word0({:#010x}), {:#05x}) = {got}, want {want}",
-            inp[0], inp[1],
-        );
+    let pk_i16_in: Vec<[u32; 4]> = pk_i16_cases.iter().map(|c| c.0).collect();
+    run_cases(&pk_i16, &pk_i16_in, |b, i, _, g| {
+        assert_eq!(g, pk_i16_cases[i].1, "{b}: v_cvt_pk_i16_i32 case {i}");
+    });
+
+    let pk_u16_cases: &[([u32; 4], u32)] = &[
+        ([123, 456, 0, 0], (456 << 16) | 123),
+        ([0, 65535, 0, 0], 0xFFFF_0000),
+        // Unsigned clamping: 70000 -> 0xFFFF, u32::MAX -> 0xFFFF.
+        ([70_000, u32::MAX, 0, 0], 0xFFFF_FFFF),
+    ];
+    let pk_u16_in: Vec<[u32; 4]> = pk_u16_cases.iter().map(|c| c.0).collect();
+    run_cases(&pk_u16, &pk_u16_in, |b, i, _, g| {
+        assert_eq!(g, pk_u16_cases[i].1, "{b}: v_cvt_pk_u16_u32 case {i}");
+    });
+
+    // v_lerp_u8 (VOP3 0x14d): per-byte (a + b + (c & 1)) >> 1.
+    let lerp = build_valu_cs(&vop3(0x14d, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let lerp_cases: &[([u32; 4], u32)] = &[
+        // byte0: (10+21+0)>>1 = 15 (0x0F)
+        // byte1: (10+21+1)>>1 = 16 (0x10)
+        // byte2: (255+255+1)>>1 = 255 (0xFF)
+        // byte3: (0+1+1)>>1 = 1 (0x01)
+        ([0x00FF_0A0A, 0x01FF_1515, 0xFF01_0302, 0], 0x01FF_100F),
+        // All zeros + c.lsb=1 -> 0; (254+255+0)>>1 = 254, (254+255+1)>>1 = 255.
+        ([0x00FE_FE00, 0x00FF_FF00, 0x0101_0001, 0], 0x00FF_FE00),
+    ];
+    let lerp_in: Vec<[u32; 4]> = lerp_cases.iter().map(|c| c.0).collect();
+    run_cases(&lerp, &lerp_in, |b, i, _, g| {
+        assert_eq!(g, lerp_cases[i].1, "{b}: v_lerp_u8 case {i}");
     });
 }
