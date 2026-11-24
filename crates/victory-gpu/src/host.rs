@@ -1217,8 +1217,12 @@ pub(crate) fn dred_on() -> bool {
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether the host stops uploading its copy over a title argument buffer
-/// before an indirect execution (`VICTORY_NO_ARGS_REFRESH=1`): the experiment
-/// that tells a title which wrote nothing from a copy that overwrote it.
+/// before an indirect execution (`VICTORY_NO_ARGS_REFRESH=1`). **A probe, not
+/// an option:** that copy is the only path a title-written record has to the
+/// GPU, so with it off every mesh dispatch asks for zero groups (measured: 102
+/// of 102 summary lines at zero, against 11,879 groups a frame with it on).
+/// It exists to ask whether we overwrite records the title wrote — the answer
+/// was no — and must never be on outside that question.
 pub(crate) fn no_args_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_ARGS_REFRESH").is_some())

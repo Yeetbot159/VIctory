@@ -320,6 +320,8 @@ code is compiled in either way.
 | `VICTORY_D3D12_DRED=1` | *diagnostics.* Enables device-removed data: the allocation a fault hit and the commands in flight |
 | `VICTORY_D3D12_DEBUG=1` | *diagnostics.* The host debug layer (needs Windows' Graphics Tools) |
 | `VICTORY_D3D12_GBV=1` | *diagnostics.* With the debug layer: GPU-based validation without state tracking, so out-of-range descriptor indices become messages naming the command instead of page faults. Slow |
+| `VICTORY_INDIRECT_RECORD=1` | logs an indirect execution's record: kind, stride, count, the words, the thread count they name, and whether the range fits the buffer. The first 64 and then every 256th. Reads the host copy as uploaded; the clamp's own counters, not this log, are the trustworthy group count |
+| `VICTORY_NO_ARGS_REFRESH=1` | **a probe, never an option:** skips the upload of the host copy over a title argument buffer before an indirect execution. That copy is the only path a title-written record has to the GPU, so with it off every mesh dispatch asks for zero groups (measured: 102 of 102 summaries at zero, against 11,879 groups a frame with it on). It answered whether we overwrite records the title wrote: we do not |
 | `VICTORY_D3D12_WARP=1` | *diagnostics.* The host device on the software adapter: a shader's wild access becomes an access violation in this process instead of a GPU fault and driver reset. Slow, and it cannot black the machine, which is why soaks and unattended runs use it |
 
 ### What the shaders did

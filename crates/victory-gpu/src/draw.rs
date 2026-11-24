@@ -2402,6 +2402,13 @@ impl State {
                 // dispatch that was handed real ones. Off, the difference
                 // between "the title wrote nothing" and "we overwrote what it
                 // wrote" shows up in the clamp's own counters.
+                // A probe, not an option. Turning the upload off means every
+                // mesh dispatch asks for zero groups, because this copy is the
+                // only path a title-written record has to the GPU: measured,
+                // 102 of 102 summary lines at zero groups against 11,879
+                // groups a frame with the copy in place. Never default it on,
+                // and read a zero-groups run as "the upload was off" before
+                // reading it as "the world dispatches nothing".
                 if !crate::host::no_args_refresh() {
                     args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 }
