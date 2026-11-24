@@ -9225,6 +9225,27 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
+                if offset_word {
+                    // DXIL wants immediate offsets in -8..=7 here; the
+                    // console's are 6-bit and may be computed. A
+                    // constant word in range becomes immediates
+                    // (upstream PR #634); anything else keeps the
+                    // offsets computed above (upstream refuses those).
+                    let w = addr_val(self, 0)?;
+                    if let Some(w) = self.s.m.int_value(w) {
+                        let w = w as u32;
+                        let field = |k: usize| {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            if x >= 32 { x - 64 } else { x }
+                        };
+                        let n = offsets.min(2);
+                        if (0..n).all(|k| (-8..=7).contains(&field(k))) {
+                            for (k, o) in os.iter_mut().enumerate().take(n) {
+                                *o = self.s.m.i32(field(k) as u32);
+                            }
+                        }
+                    }
+                }
             match op {
                 // Outside a pixel shader there are no screen derivatives:
                 // the validator refuses `sample` there ("features
@@ -9248,27 +9269,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     self.s
