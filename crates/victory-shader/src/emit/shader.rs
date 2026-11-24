@@ -139,8 +139,11 @@ pub(crate) struct Shader {
     pub cmp_samplers: u64,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
-    /// Root SRVs (raw buffers) read, likewise.
-    pub root_srvs: Vec<(u8, V)>,
+    /// Root SRVs (raw buffers) read, with their registers: a register
+    /// below 256 is a root descriptor's parameter index; above, the qword
+    /// at `(reg >> 8) - 1` of that parameter's root constants (a pointer
+    /// the program loaded).
+    pub root_srvs: Vec<(u16, V)>,
     /// Root UAVs (raw buffers) read and written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
@@ -299,11 +302,11 @@ impl Shader {
     }
 
     /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
-    pub fn root_srv_handle(&mut self, slot: u8) -> V {
-        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+    pub fn root_srv_handle(&mut self, reg: u16) -> V {
+        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == reg) {
             return h;
         }
-        let r = self.m.i32(u32::from(slot));
+        let r = self.m.i32(u32::from(reg));
         let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
@@ -318,7 +321,7 @@ impl Shader {
         );
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
-        self.root_srvs.push((slot, h));
+        self.root_srvs.push((reg, h));
         h
     }
 

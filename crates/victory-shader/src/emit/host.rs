@@ -132,17 +132,18 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, u8)> = stages
+        let mut views: Vec<(u16, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let cbvs = s.root_cbvs.iter().map(|&r| (u16::from(r), 0));
                 let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+                cbvs.chain(srvs)
+                    .chain(s.root_uavs.iter().map(|&r| (u16::from(r), 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, kind) in views {
+        for (reg, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -151,7 +152,7 @@ impl Host {
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
+                        ShaderRegister: u32::from(reg),
                         RegisterSpace: super::ROOT_CBV_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
@@ -549,6 +550,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 
 /// A root argument for [`Host::draw`].
 #[cfg(test)]
+#[derive(Clone)]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.
@@ -560,6 +562,16 @@ pub enum Root {
     /// dwords ([`Host::dispatch`] only).
     View {
         srv: bool,
+        data: Vec<u32>,
+    },
+    /// A raw buffer whose GPU address a root-constants parameter carries:
+    /// the shader loads the pointer from dword `dword` of the constants at
+    /// root parameter `slot` and reads through it, so the host binds this
+    /// buffer as a root SRV and patches the constants with its address.
+    /// (How titles drive bindings from the GPU.)
+    Pointer {
+        slot: u32,
+        dword: u32,
         data: Vec<u32>,
     },
 }
@@ -799,7 +811,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Pointer { .. } => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1378,7 +1392,30 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
-            for (param, arg) in &d.roots {
+            // Pointers first: each `Pointer` root is a raw buffer the shader
+            // reads through, and its GPU address rides in a root-constants
+            // parameter; upload the buffers, patch the constants, then bind.
+            let mut roots = d.roots.clone();
+            let mut vas = Vec::new();
+            for (_, arg) in &mut roots {
+                let Root::Pointer { slot, dword, data } = arg else {
+                    continue;
+                };
+                let b = upload(data)?;
+                vas.push((*slot, *dword, b.GetGPUVirtualAddress()));
+                keep.push(b);
+            }
+            for (slot, dword, va) in &vas {
+                if let Some((_, Root::Constants(c))) = roots
+                    .iter_mut()
+                    .find(|(p, r)| p == slot && matches!(r, Root::Constants(_)))
+                {
+                    let i = *dword as usize;
+                    c[i] = *va as u32;
+                    c[i + 1] = (*va >> 32) as u32;
+                }
+            }
+            for (param, arg) in &roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
@@ -1405,6 +1442,13 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Pointer { slot, .. } => {
+                        let (_, _, va) = vas
+                            .iter()
+                            .find(|(s, _, _)| s == slot)
+                            .ok_or("a pointer without its buffer")?;
+                        list.SetComputeRootShaderResourceView(*param, *va);
                     }
                 }
             }

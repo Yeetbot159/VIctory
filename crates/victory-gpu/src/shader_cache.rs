@@ -206,10 +206,14 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
-        word(&mut out, slots.len() as u32);
-        out.extend(slots);
+    word(&mut out, s.root_cbvs.len() as u32);
+    out.extend(&s.root_cbvs);
+    word(&mut out, s.root_srvs.len() as u32);
+    for &reg in &s.root_srvs {
+        word(&mut out, u32::from(reg));
     }
+    word(&mut out, s.root_uavs.len() as u32);
+    out.extend(&s.root_uavs);
     word(&mut out, u32::from(s.stride_table));
     out
 }
@@ -266,7 +270,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         });
     }
     let root_cbvs = r.list()?;
-    let root_srvs = r.list()?;
+    let n = r.word()? as usize;
+    let mut root_srvs = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_srvs.push(u16::try_from(r.word()?).ok()?);
+    }
     let root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {

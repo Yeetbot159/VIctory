@@ -253,11 +253,13 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
-    /// Root parameters of its root views: (title root parameter, ours).
-    pub(crate) root_cbvs: Vec<(u8, u32)>,
-    pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Root parameters of its root views: (title root parameter, ours). A
+    /// title root parameter is its shader register, which an SRV read
+    /// through a pointer the program loaded encodes above 255.
+    pub(crate) root_cbvs: Vec<(u16, u32)>,
+    pub(crate) root_srvs: Vec<(u16, u32)>,
     /// Root UAVs, each a one-view table.
-    pub(crate) root_uavs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u16, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
 }
@@ -370,12 +372,9 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
+            let cbvs: Vec<u16> = t.root_cbvs.iter().copied().map(u16::from).collect();
             for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
+                (&cbvs, D3D12_ROOT_PARAMETER_TYPE_CBV, &mut stage.root_cbvs),
                 (
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -408,7 +407,7 @@ impl HostPipeline {
                     OffsetInDescriptorsFromTableStart: 0,
                 }));
                 let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                stage.root_uavs.push((slot, params.len() as u32));
+                stage.root_uavs.push((u16::from(slot), params.len() as u32));
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                     Anonymous: D3D12_ROOT_PARAMETER1_0 {
