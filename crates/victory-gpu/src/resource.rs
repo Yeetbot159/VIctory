@@ -1003,6 +1003,56 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// A title texture's description as the host's copy has it: the title's,
+/// without the console's layout, and with the flags and formats the host
+/// allows. Also whether the title's clear value can come along: the host
+/// refuses one on a resource without a render target or depth flag, which a
+/// format's own refusals may have taken away.
+#[cfg(windows)]
+fn host_texture_desc(desc: &ResourceDesc) -> (ResourceDesc, bool) {
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
+    let mut base = *desc;
+    base.layout = 0;
+    base.alignment = 0;
+    base.flags &= PC_FLAGS;
+    // PC refuses depth targets that are also unordered-access (the console
+    // allows both; Grand Theft Auto VI's shadow maps ask for it).
+    // shortcut: the host copy loses UAV use, and a UAV view of it reads
+    // zeros (see `crate::descriptor::host`); give it a second copy if draws
+    // write it as a UAV.
+    if base.flags & DEPTH != 0 {
+        base.flags &= !UNORDERED;
+    }
+    base.format = pc_format(base.format);
+    // Xbox permits video and certain 16-bit formats as render targets and
+    // UAVs; PC D3D12 refuses those flag combinations.
+    // NV12 (86): planar YUV video format — no RTV or UAV on PC.
+    // B4G4R4A4_UNORM (115): 16-bit color format — RTV not supported on D3D12.
+    // Strip the offending flags so the host texture is created as a shader
+    // resource; Bink2 may still write video frames via the D3D12 video-decode
+    // path rather than UAV writes.
+    match base.format {
+        86 => base.flags &= !(RENDER_TARGET | UNORDERED), // NV12: no RTV or UAV
+        115 => base.flags &= !RENDER_TARGET,              // B4G4R4A4_UNORM: no RTV
+        _ => {}
+    }
+    if base.flags & DENY_SHADER_RESOURCE == 0
+        && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == base.format)
+    {
+        base.format = typeless;
+    }
+    // The host has no sRGB unordered access: such textures are typeless,
+    // their unordered access views plain UNORM.
+    if base.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == base.format) {
+        base.format = family(base.format);
+    }
+    (base, base.flags & (RENDER_TARGET | DEPTH) != 0)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags. Returns the host resource and the
 /// number of top mips dropped.
@@ -1024,52 +1074,14 @@ fn host_texture_with_drop(
     pressure: &std::sync::atomic::AtomicU32,
 ) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
-    const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
     }
     let host = crate::host::host()?;
-    let mut base = *desc;
-    base.layout = 0;
-    base.alignment = 0;
-    base.flags &= PC_FLAGS;
-    // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps ask for it).
-    // shortcut: the host copy loses UAV use; give it a second view-only
-    // copy if draws write it as a UAV.
-    const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
-    if base.flags & DEPTH != 0 {
-        base.flags &= !UNORDERED;
-    }
-    base.format = pc_format(base.format);
-    // Xbox permits video and certain 16-bit formats as render targets and
-    // UAVs; PC D3D12 refuses those flag combinations.
-    // NV12 (86): planar YUV video format — no RTV or UAV on PC.
-    // B4G4R4A4_UNORM (115): 16-bit color format — RTV not supported on D3D12.
-    // Strip the offending flags so the host texture is created as a shader
-    // resource; Bink2 may still write video frames via the D3D12 video-decode
-    // path rather than UAV writes.
-    const RENDER_TARGET: u32 = 1;
-    match base.format {
-        86 => base.flags &= !(RENDER_TARGET | UNORDERED), // NV12: no RTV or UAV
-        115 => base.flags &= !RENDER_TARGET,              // B4G4R4A4_UNORM: no RTV
-        _ => {}
-    }
-    const DENY_SHADER_RESOURCE: u32 = 8;
-    if base.flags & DENY_SHADER_RESOURCE == 0
-        && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == base.format)
-    {
-        base.format = typeless;
-    }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if base.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == base.format) {
-        base.format = family(base.format);
-    }
+    let (base, keep_clear) = host_texture_desc(desc);
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (keep_clear && !clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2150,6 +2162,94 @@ mod tests {
         msaa.sample_count = 4;
         assert_eq!(compute_mip_drop(&msaa, 2), 0);
         assert_eq!(compute_mip_drop(&buffer(1 << 20), 2), 0);
+    }
+
+    fn tex3d(
+        width: u64,
+        height: u32,
+        depth: u16,
+        mips: u16,
+        format: u32,
+        flags: u32,
+    ) -> ResourceDesc {
+        ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: depth,
+            ..tex2d(width, height, mips, format, flags)
+        }
+    }
+
+    /// The descriptions the log refused (`no host texture` for formats 86 and
+    /// 115 at 1024x4096 and 2560x1440) make host descriptions the device
+    /// accepts. Those formats lose the render target and unordered access
+    /// flags the console allows, and with them the title's clear value: the
+    /// device refuses one on a resource without either flag, which is what
+    /// failed. Real 3D textures keep the device's own rules too.
+    #[test]
+    #[cfg(windows)]
+    fn host_descriptions_are_ones_the_device_accepts() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        const RENDER_TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const UNORDERED: u32 = 4;
+        fn device_desc(desc: &ResourceDesc) -> D3D12_RESOURCE_DESC {
+            // SAFETY: a host description has the device description's layout.
+            unsafe {
+                std::ptr::from_ref(desc)
+                    .cast::<D3D12_RESOURCE_DESC>()
+                    .read()
+            }
+        }
+        // The log's three, as the host had them.
+        for title in [
+            tex2d(1024, 4096, 1, 86, RENDER_TARGET),
+            tex2d(2560, 1440, 1, 86, RENDER_TARGET | UNORDERED),
+            tex2d(2560, 1440, 1, 115, RENDER_TARGET),
+        ] {
+            let (host, keep_clear) = host_texture_desc(&title);
+            let d = device_desc(&host);
+            assert_eq!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+            assert!(
+                !keep_clear,
+                "no clear value without a render target or depth flag: {host:?}"
+            );
+            assert_eq!(d.Flags.0 as u32 & (RENDER_TARGET | DEPTH), 0, "{host:?}");
+            assert!(d.DepthOrArraySize >= 1);
+            assert!(u32::from(d.MipLevels) <= mip_count(&title), "{host:?}");
+        }
+        // A render target keeps its clear value; a depth target keeps the
+        // depth flag and loses only the unordered access flag PC refuses.
+        let target = tex2d(1024, 1024, 1, 28, RENDER_TARGET);
+        let (host, keep_clear) = host_texture_desc(&target);
+        assert!(keep_clear && device_desc(&host).Flags.0 as u32 == RENDER_TARGET);
+        let depth = tex2d(1024, 1024, 1, 55, DEPTH | UNORDERED);
+        let (host, keep_clear) = host_texture_desc(&depth);
+        let d = device_desc(&host);
+        assert!(keep_clear && d.Flags.0 as u32 == DEPTH, "{host:?}");
+        assert_eq!(d.Format.0 as u32, 53, "a depth target's copy is typeless");
+        // 3D: one sample, at least one layer, and no more mips than the chain
+        // the longest side allows.
+        for title in [
+            tex3d(64, 64, 64, 1, 28, 0),
+            tex3d(32, 32, 4, 0, 28, 0),
+            tex3d(128, 64, 8, 8, 71, 0),
+        ] {
+            let (host, _) = host_texture_desc(&title);
+            let d = device_desc(&host);
+            let longest = title
+                .width
+                .max(u64::from(title.height))
+                .max(u64::from(title.depth_or_array_size));
+            let chain = 64 - longest.leading_zeros();
+            assert_eq!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+            assert_eq!(d.SampleDesc.Count, 1);
+            assert!(d.DepthOrArraySize >= 1);
+            assert!(
+                u32::from(d.MipLevels) <= chain,
+                "{host:?}: more mips than the {chain}-level chain"
+            );
+            assert_eq!(d.DepthOrArraySize, title.depth_or_array_size);
+        }
     }
 
     #[test]

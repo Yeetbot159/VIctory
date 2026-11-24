@@ -1139,7 +1139,22 @@ fn fits(
         d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
     };
     let own = d.Format.0 as u32;
+    // The console lets a depth target be written as a UAV; PC refuses a
+    // resource that is both, so its host copy is made without the permission
+    // (see `crate::resource::host_texture_desc`), and a UAV view of one would
+    // remove the device. Such a slot reads zeros and drops its writes: a
+    // console-only combination, not a host failure, so it is not a warning.
+    let console_only =
+        unordered && !allowed && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
     if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
+        if console_only {
+            tracing::debug!(
+                format = own,
+                flags = d.Flags.0,
+                "unordered view of a depth target: its host copy has no unordered access"
+            );
+            return false;
+        }
         once!(
             unordered,
             format = own,
@@ -1713,6 +1728,118 @@ mod tests {
             return;
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The console's shadow maps are depth targets written as UAVs. PC makes
+    /// neither a resource that is both nor a UAV view of one (it removes the
+    /// device), so the host copy is a depth target alone and the UAV view is
+    /// refused: its slot reads zeros instead of failing the draw.
+    #[test]
+    fn a_depth_target_takes_no_unordered_view() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let texture = |format: u32, flags: D3D12_RESOURCE_FLAGS| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a 4x4 texture.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        // What the console asks for cannot be created at all.
+        let both = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation attempt of a refusable description.
+        let refused = unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &both,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            )
+        };
+        assert_eq!(
+            refused.unwrap_err().code(),
+            windows::Win32::Foundation::E_INVALIDARG
+        );
+        // The host copy a D16 depth target of the console's makes: typeless,
+        // depth only, and no UAV view of it.
+        let depth = texture(53, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        let mut unordered_format = DXGI_FORMAT_R16_FLOAT;
+        assert!(!fits(
+            &host.device,
+            &depth,
+            Some(&mut unordered_format),
+            true
+        ));
+        let mut shader_format = DXGI_FORMAT_R16_FLOAT;
+        assert!(
+            fits(&host.device, &depth, Some(&mut shader_format), false),
+            "a depth target is still shader-readable"
+        );
+        // The same texture with the UAV permission keeps the view; without
+        // the permission the slot gets a null UAV of the title's dimension.
+        if supports_typed_uav(&host.device, DXGI_FORMAT_R16_FLOAT) {
+            let writable = texture(53, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let mut format = DXGI_FORMAT_R16_FLOAT;
+            assert!(fits(&host.device, &writable, Some(&mut format), true));
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let view = View::Unordered(0, 0, Some([53, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(make(&view, heap.cpu(0)).is_none());
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
