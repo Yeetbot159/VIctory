@@ -778,7 +778,10 @@ mod bits {
         let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let set = hi & 0x1000_0000 != 0;
         let sets = SET.fetch_add(u64::from(set), Ordering::Relaxed) + u64::from(set);
-        if SAMPLES.fetch_add(1, Ordering::Relaxed) < 64 {
+        // The sample is of the rare event, not the common one: a descriptor with the
+        // bit set is what the question is about, and the first 64 descriptors a title
+        // creates are the ones every title creates.
+        if set && SAMPLES.fetch_add(1, Ordering::Relaxed) < 64 {
             tracing::info!(
                 kind,
                 total,
