@@ -9232,7 +9232,13 @@ impl<'a> Lower<'a> {
             if offset_word && offsets > 0 {
                 let w = addr_val(self, 0)?;
                 for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
+                    // The console packs x in bits 0-5 and y in bits 8-13; the
+                    // shift up puts the field's top bit (5 or 13) at bit 31, so
+                    // the arithmetic shift down by 26 sign-extends it: 26 is
+                    // the compensating amount, not the field's position.
+                    // (`(v << 26) >> 26` is bits 0-5, `(v << 18) >> 26` bits
+                    // 8-13, both signed — the same fields `_o`'s immediate path
+                    // takes with a mask and a sign test.)
                     let left = self.s.m.i32(at);
                     let t = self.s.m.bin(c, Bin::Shl, w, left);
                     let k26 = self.s.m.i32(26);
