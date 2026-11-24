@@ -455,15 +455,20 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
-        let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
         if kind == KIND_NATIVE_RAW {
-            if size > MAX_UNPACKED {
-                return Err(Malformed("implausible FSSM size"));
+            // Uncompressed entries were skipped before they were read: one
+            // that is not a valid FSSM is skipped still, and does not cost
+            // the container its other entries.
+            if size <= MAX_UNPACKED
+                && let Some(blob) = bytes(part, offset, size)
+                && let Ok(found) = programs(blob)
+            {
+                out.extend(found);
             }
-            out.extend(programs(blob)?);
-        } else {
-            out.extend(programs(&unpack(blob)?)?);
+            continue;
         }
+        let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
+        out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
 }
@@ -879,7 +884,24 @@ pub(crate) mod tests {
         let raw = part(&[(KIND_NATIVE_RAW, &blob)]);
         let packed = part(&[(KIND_NATIVE, &xbch(&blob))]);
         assert_eq!(native_programs(&raw).unwrap(), native_programs(&packed).unwrap());
-        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..16])])).is_err());
+        // An uncompressed entry that is no FSSM is skipped, as all were
+        // before they were read, and keeps the container's other entries.
+        assert_eq!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..16])])).unwrap(), []);
+        let beside = part(&[(KIND_NATIVE_RAW, &blob[..16]), (KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(native_programs(&beside).unwrap(), native_programs(&packed).unwrap());
+    }
+
+    #[test]
+    fn a_geometry_record_without_a_copy_program_keeps_no_stage_io() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        blob[e..e + STAGE_DATA].fill(0);
+        // The copy VS's record points past the payload.
+        blob[e + 0x34..e + 0x3c].copy_from_slice(&u64::MAX.to_le_bytes());
+        let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].stage, HwStage::Gs);
+        assert_eq!(found[0].io, StageIo::None);
     }
 
     #[test]
