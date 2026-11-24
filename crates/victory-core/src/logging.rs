@@ -29,7 +29,44 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stderr),
+                .with_writer(writer),
         )
         .try_init();
+}
+
+/// Where events go, and whether each one reaches the file as it is logged.
+///
+/// A run that is killed, or whose machine goes away mid-session, used to leave
+/// the log cut at whatever the writer still held — the last operations before
+/// a device removal are exactly the ones that were lost. `VICTORY_LOG_FLUSH=1`
+/// flushes after every event, so a truncated log is truncated at the real last
+/// event rather than at a buffer boundary.
+fn writer() -> FlushWriter {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FlushWriter(*ON.get_or_init(|| std::env::var_os("VICTORY_LOG_FLUSH").is_some()))
+}
+
+struct FlushWriter(bool);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FlushWriter {
+    type Writer = FlushWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FlushWriter(self.0)
+    }
+}
+
+impl std::io::Write for FlushWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut out = std::io::stderr();
+        let n = out.write(buf)?;
+        if self.0 {
+            out.flush()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
 }
