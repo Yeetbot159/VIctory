@@ -146,24 +146,30 @@ attribute at channels x, y and z, each in both halves (`v_interp_p1ll_f16` and
 reads halves the row carries and we do not name: this is a **declaration**
 bug, not a source we lack.
 
-The program's own behaviour settles what the console's column count means. A
-compiler does not read past the signature it declared, and this one reads six
-halves of a `cols 4` pixel element, so four columns cannot be four halves: for
-a 16-bit element the console counts **32-bit registers**, four of them, eight
-halves. The same file shows the convention on its 32-bit rows — `TEXCOORD4` at
-row 4 `col 0, cols 2` and `TEXCOORD5` at `col 2, cols 2`, two elements filling
-one row's four registers by column. `packed_half`'s `extent` reads that
-register count as a half count, so halves 4-7 of a packed row are invisible.
+The console's own declaration contradicts both readings, which is why this is
+diagnosed and not fixed. For `c005/11190.dxbc` the pixel `ISG1` holds
 
-So the fix is not a width in `packed_half`; it is the signature model. A host
-element carries at most four components per register row, so a packed
-attribute of `cols` registers is `2 * cols` halves spread over `ceil(cols/2)`
-register rows, every later row of the signature shifts by the difference, and
-the vertex or mesh stage that writes the attribute has to declare the same
-shape or the two signatures do not link. That is a change to
-`emit::mod`'s signature assembly on both sides of the pair, not a patch inside
-one lowering, and it needs a real run to verify against the title's own data —
-which is why it is written down here rather than half-done.
+```
+TEXCOORD[1]  row=3  mask=0xF  type=6 (16-bit)
+TEXCOORD[4]  row=4  mask=0x3  type=3
+TEXCOORD[5]  row=4  mask=0xC  type=3
+TEXCOORD[6]  row=5  mask=0x7  type=3
+```
+
+and the program interpolates halves 0-5 of the row-3 attribute. `mask` is a
+four-bit field, so read as halves the element holds four and is two short of
+what the program reads; read as 32-bit registers it holds four *dwords*,
+registers 3-6, which collides with `TEXCOORD[4]`/`[5]` at row 4 and
+`TEXCOORD[6]`/`[7]` at row 5. Neither reading covers the read, so the
+attribute index an interpolation names is not simply the signature's
+`Register` field, or the 16-bit mask counts in a space the signature does not
+describe. A widening built on either guess changes what the host interpolates
+for a live attribute, which is the black-scene class rather than a refusal.
+
+So the honest state of this family is the loud refusal it already produces,
+and the next step is to identify that index space from a pair that works: a
+program whose 16-bit attribute reads halves past its `mask`, next to the
+vertex stage that writes it.
 
 The rule any version of it must keep: a pixel input never silently reads zero,
 and a width that decodes a neighbour's dword is the black-scene class rather
@@ -213,3 +219,61 @@ which the emitter does not implement. Nothing here is a phi that was missed.
 **The rest** are single programs each (`s_getpc_b64`, `v_cvt_f32_f64`, an LDS
 operation, `v_permlanex16_b32`, a whole-wave section step); each is a small,
 self-contained instruction to add once something depends on it.
+
+## One compute module the validator refuses
+
+`015832d72477fb26` (a 99 KB Cs, wave32) emits, creates a PSO,
+and fails DXIL.dll: `Function: main: error: Function uses features
+incompatible with the shader stage (cs) of the entry function`. It is one of
+the 35 compute hashes a keyed run never brought into existence, where the
+other 585 refused hashes in the same log bind a pipeline minutes later.
+
+Three things it is not, each measured rather than argued:
+
+- **Not its feature declaration.** Clearing `SFI0`'s WAVE_OPS (`0x4000`),
+  INT64 (`0x8000`), and both heap bits (`0x600_0000`) in four variants — no
+  clear, each alone, both together — gives the identical error.
+- **Not a stage-illegal `dx.op`.** Against a compute module that validates, its
+  op set is unique in fourteen entries (`bufferLoad`/`bufferStore`,
+  `flattenedThreadIdInGroup`, `legacyF32ToF16`/`legacyF16ToF32`, `sample`,
+  `sampleCmpLevelZero`, `unary.f32 28`, `unaryBits`, and five wave ops), every
+  one legal in a compute shader and every opcode correct for its name.
+- **Not its entry properties.** `threads=[32,1,1]`, `wave=32`, no input or
+  output signature, no barycentrics.
+
+So it is in the call graph or the metadata the entry point does not carry. A
+class bisect of the emitter's op calls (a temporary `VICTORY_OP_SKIP` hook that
+substitutes a typed zero) excludes three of the ten candidate classes — the
+unary ops, the two legacy f16 conversions, and `flattenedThreadIdInGroup` all
+leave the original error unchanged when zeroed — and leaves four inconclusive:
+`sample`/`sampleCmpLevelZero`, `bufferLoad`/`bufferStore`, `textureGather`/
+`textureLoad`, and the wave ops. Those four return vectors, and a vector return
+has no typed zero here, so the hook falls back to `undef` and the validator
+reports `Instructions should not read uninitialized value` before it reaches the
+stage check. The refinement is a zero initializer for an arbitrary type; without
+one those four cannot be separated by this method.
+
+The four variants were run through a temporary `VICTORY_SFI0_CLEAR` mask in the
+emitter; it is not in the tree.
+
+## The lane-mask join, after inspecting it
+
+Five compute programs in `c012` refuse `a lane-mask join of an untracked mask`.
+Instrumenting the refusal shows every one of them joining a value that no
+instruction writes:
+
+```
+join: arg=Value(2453) def=None block=5  off=0x568
+join: arg=Value(6625) def=None block=39 off=0xbc0
+join: arg=Value(6586) def=None block=5  off=0x520
+join: arg=Value(4307) def=None block=38 off=0xc40
+join: arg=Value(7004) def=None block=5  off=0x508
+```
+
+The refusal reads `st.masks` directly (`lower.rs:8670`) rather than
+`st.mask_bits(low, high)`, which is how every other mask use resolves a Wave64
+pair, so the obvious correction was to use the accessor. It was tried and it
+does not resolve these: `c012` still emits 228 of 234 compute programs. So these
+values are in neither `masks` nor `paired_masks` — they are entry or phi values
+the mask analysis never binds — and a join of a mask nothing tracks is exactly
+where the refusal is the right answer rather than a width to widen.
