@@ -820,8 +820,15 @@ pub(crate) mod tests {
     }
 
     /// Synthetic geometry record with the embedded copy VS following its
-    /// graphics header. Both code offsets are relative to the payload.
-    pub(crate) fn geometry_part(code: &[u8], copy: &[u8]) -> Vec<u8> {
+    /// graphics header, `vertex_dwords` ring dwords per vertex (three
+    /// vertices) and the copy VS's output table (`usage, row, param, _, _,
+    /// flags` per entry).
+    pub(crate) fn geometry_part_sized(
+        code: &[u8],
+        copy: &[u8],
+        vertex_dwords: u32,
+        outputs: &[[u8; 6]],
+    ) -> Vec<u8> {
         let mut blob = fssm(&[(HwStage::Gs, code)]);
         let e = stage_data_at(&blob, HwStage::Gs);
         blob[e..e + STAGE_DATA].fill(0);
@@ -829,9 +836,22 @@ pub(crate) mod tests {
         let start = (blob.len() - FSSM_HEADER) as u64;
         blob[record..record + 8].copy_from_slice(&start.to_le_bytes());
         blob[record + 8..record + 16].copy_from_slice(&(copy.len() as u64).to_le_bytes());
-        for (offset, value) in [(0x27c, 12u32), (0x280, 1), (0x284, 3), (0x28c, 4)] {
+        for (offset, value) in [
+            (0x27c, 3 * vertex_dwords),
+            (0x280, 1),
+            (0x284, 3),
+            (0x28c, vertex_dwords),
+        ] {
             blob[e + offset..e + offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        // The copy VS's own stage data follows its record.
+        let copy_data = record + RECORD_SIZE as usize;
+        for (k, o) in outputs.iter().enumerate() {
+            let at = copy_data + VS_OUTPUTS + 6 * k;
+            blob[at..at + 6].copy_from_slice(o);
+        }
+        let count = copy_data + VS_OUTPUT_COUNT;
+        blob[count..count + 4].copy_from_slice(&(outputs.len() as u32).to_le_bytes());
         blob.extend(copy);
         let payload = (blob.len() - FSSM_HEADER) as u64;
         blob[8..16].copy_from_slice(&payload.to_le_bytes());

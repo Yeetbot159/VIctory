@@ -7,6 +7,20 @@ fn bytes(words: &[u32]) -> Vec<u8> {
 }
 
 fn geometry_part() -> Vec<u8> {
+    geometry_part_with(false)
+}
+
+fn geometry_part_with(params: bool) -> Vec<u8> {
+    fixture(params, false)
+}
+
+/// The GS of [`geometry_part`]; with `params`, each vertex also carries its
+/// input row 1 (TEXCOORD0.xy, LDS dwords 4-5) in ring dwords 4-5, which the
+/// copy VS exports as param0 (signature row 1). With `rewrite`, the GS
+/// stores to vertex 0's slot again after emitting all three.
+fn fixture(params: bool, rewrite: bool) -> Vec<u8> {
+    let vertex_dwords = if params { 6 } else { 4 };
+    let stride = 4 * 3 * vertex_dwords;
     let mut words = vec![
         // Establish EXEC from the merged GS lane count in s3.
         0x9404ff03,
@@ -22,13 +36,19 @@ fn geometry_part() -> Vec<u8> {
         0xfa0000b8,
         0x8f0c880c,
         0x810c020c,
-        // Lane within the wave; v5 = wave base + lane * 48 bytes.
+        // Lane within the wave; v5 = wave base + lane * stride bytes.
         0xd7650004,
         0x000100c1,
         0xd7660004,
         0x000208c1,
         0xd5430005,
-        (12 << 18) | (260 << 9) | 176,
+    ];
+    if stride == 48 {
+        words.push((12 << 18) | (260 << 9) | 176);
+    } else {
+        words.extend([(12 << 18) | (260 << 9) | 255, stride]);
+    }
+    words.extend([
         // Unpack the first, second, and third vertex offsets to v6/v7/v8.
         0x340c0082,
         0x360c0cff,
@@ -38,16 +58,19 @@ fn geometry_part() -> Vec<u8> {
         0x34100282,
         0x361010ff,
         0x3fffc,
-    ];
+    ]);
     for v in 0..3 {
         let addr = 6 + v;
         words.extend([0xd8dc0100, 10 << 24 | addr, 0xd8dc0302, 12 << 24 | addr]);
+        if params {
+            words.extend([0xd8dc0504, 14 << 24 | addr]); // ds_read2_b32 v[14:15], dwords 4, 5
+        }
         if v == 0 {
             // v_add_f32 v10, 0.5, v10
             words.push(0x06000000 | 10 << 17 | 10 << 9 | 240);
         }
-        for pair in 0..2 {
-            let k = 4 * v + 2 * pair;
+        for pair in 0..vertex_dwords / 2 {
+            let k = vertex_dwords * v + 2 * pair;
             let src = 10 + 2 * pair;
             words.extend([
                 0xd8380000 | (k + 1) << 8 | k,
@@ -56,8 +79,11 @@ fn geometry_part() -> Vec<u8> {
         }
         words.push(0xbf900022); // emit
     }
+    if rewrite {
+        words.extend([0xd8380100, 11 << 16 | 10 << 8 | 5]); // ds_write2_b32 v5, v10, v11 offsets 0, 1
+    }
     words.extend([0xbf900012, 0xbf900003, 0xbf810000]); // cut, done, endpgm
-    let copy = bytes(&[
+    let mut copy = vec![
         0x8701ff01,
         255,
         0x34000082,
@@ -69,29 +95,59 @@ fn geometry_part() -> Vec<u8> {
         6,
         0xd8dc0302,
         2 << 24 | 6,
-        0xf80008cf,
-        0x03020100,
-        0xbf810000, // exp pos0, v0..v3
-    ]);
-    crate::native::tests::geometry_part(&bytes(&words), &copy)
+    ];
+    if params {
+        // ds_read2_b32 v[8:9], dwords 4, 5; exp param0 v8, v9, off, off
+        copy.extend([0xd8dc0504, 8 << 24 | 6, 0xf8000203, 0x0000_0908]);
+    }
+    copy.extend([0xf80008cf, 0x03020100, 0xbf810000]); // exp pos0, v0..v3
+    // param0 is generic (6) output row 1.
+    let outputs: &[[u8; 6]] = if params { &[[6, 1, 0, 0, 0, 0]] } else { &[] };
+    crate::native::tests::geometry_part_sized(&bytes(&words), &bytes(&copy), vertex_dwords, outputs)
 }
 
 #[cfg(windows)]
 #[test]
 fn geometry_vertices_match_reference_draw() {
+    reference_draw(false);
+}
+
+/// The parameter-export path: a ring dword the copy VS exports as param0
+/// reaches the pixel shader's TEXCOORD0 (signature row 1).
+#[cfg(windows)]
+#[test]
+fn geometry_parameters_match_reference_draw() {
+    reference_draw(true);
+}
+
+#[cfg(windows)]
+fn reference_draw(params: bool) {
     use super::{HostShader, container, host, translate, validator::Validator};
     use crate::{Container, FourCC, HwStage};
     let Some(dxc) = Validator::default_path()
         .map(|p| p.with_file_name("dxc.exe"))
         .filter(|p| p.exists())
     else {
+        eprintln!("no dxc.exe beside dxil.dll: the reference draw was skipped");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("victory-gs-draw-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "victory-gs-draw-{}-{}",
+        std::process::id(),
+        u8::from(params)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let hlsl = dir.join("triangle.hlsl");
-    std::fs::write(
-        &hlsl,
+    let source = if params {
+        r#"
+        struct V { float4 p: SV_Position; float2 t: TEXCOORD0; };
+        V vs(float4 p: POSITION) { V v; v.p=p; v.t=p.xy*0.5+0.5; return v; }
+        [maxvertexcount(3)] void gs(triangle V v[3], inout TriangleStream<V> s) {
+            v[0].p.x += 0.5; s.Append(v[0]); s.Append(v[1]); s.Append(v[2]); s.RestartStrip();
+        }
+        float4 ps(V v): SV_Target { return float4(1, v.t, 1); }
+    "#
+    } else {
         r#"
         struct V { float4 p: SV_Position; };
         V vs(float4 p: POSITION) { V v; v.p=p; return v; }
@@ -99,9 +155,9 @@ fn geometry_vertices_match_reference_draw() {
             v[0].p.x += 0.5; s.Append(v[0]); s.Append(v[1]); s.Append(v[2]); s.RestartStrip();
         }
         float4 ps(): SV_Target { return float4(1, 0, 0, 1); }
-    "#,
-    )
-    .unwrap();
+    "#
+    };
+    std::fs::write(&hlsl, source).unwrap();
     let compile = |entry, stage| {
         let output = dir.join(format!("{entry}.dxil"));
         let proc = std::process::Command::new(&dxc)
@@ -124,7 +180,7 @@ fn geometry_vertices_match_reference_draw() {
     let vs = compile("vs", HwStage::Vs);
     let ps = compile("ps", HwStage::Ps);
     let reference = compile("gs", HwStage::Gs);
-    let native = geometry_part();
+    let native = geometry_part_with(params);
     let packed = Container::parse(&reference.dxil).unwrap();
     let parts: Vec<_> = packed
         .parts
@@ -158,7 +214,9 @@ fn geometry_vertices_match_reference_draw() {
         mesh_groups: 0,
     };
     for warp in [false, true] {
+        let backend = if warp { "WARP" } else { "the default adapter" };
         let Ok(host) = host::Host::new(warp) else {
+            eprintln!("no device on {backend}: its draw was skipped");
             continue;
         };
         let run = |stage| {
@@ -172,6 +230,9 @@ fn geometry_vertices_match_reference_draw() {
             "reference covered {covered}/256 pixels"
         );
         assert_eq!(run(&gs), expected);
+        eprintln!(
+            "{backend}, params {params}: the translated GS drew the reference's {covered}/256 pixels"
+        );
     }
     for name in ["triangle.hlsl", "vs.dxil", "ps.dxil", "gs.dxil"] {
         std::fs::remove_file(dir.join(name)).unwrap();
@@ -245,4 +306,57 @@ fn geometry_io_keeps_component_order_and_constants_in_the_copy_export() {
         }
     }
     assert_eq!(vertices, 3);
+}
+
+/// The program and stage data of a fixture.
+fn raised(part: &[u8]) -> Result<crate::geometry::Streams, crate::ShaderError> {
+    let native = crate::native_programs(part).unwrap().pop().unwrap();
+    let program = native.translation_ir().unwrap();
+    let crate::native::StageIo::Gs(geometry) = native.io else {
+        panic!("missing GS data");
+    };
+    crate::geometry::raise(&program, &geometry)
+}
+
+#[test]
+fn geometry_parameters_raise_into_their_copy_export() {
+    use crate::geometry::StreamOp;
+    let streams = raised(&geometry_part_with(true)).unwrap();
+    let emits: Vec<_> = streams
+        .messages
+        .values()
+        .filter_map(|m| match m {
+            StreamOp::Emit(outputs) => Some(outputs),
+            StreamOp::Cut => None,
+        })
+        .collect();
+    assert_eq!(emits.len(), 3);
+    for outputs in emits {
+        let [param, pos] = outputs.as_slice() else {
+            panic!("copy exports: {outputs:?}");
+        };
+        assert_eq!((param.target, pos.target), (32, 12));
+        assert!(pos.channels.iter().all(Option::is_some));
+        assert!(param.channels[..2].iter().all(Option::is_some));
+        assert_eq!(param.channels[2..], [None, None]);
+    }
+    // Vertex i reads input dwords 0-5: rows 0 and 1.
+    let reads: Vec<_> = streams.reads.values().flatten().map(|r| (r.1, r.2)).collect();
+    for v in 0..3 {
+        for dword in 0..6 {
+            assert!(reads.contains(&(v, dword)), "vertex {v} dword {dword}");
+        }
+    }
+}
+
+#[test]
+fn a_ring_store_after_its_vertex_was_emitted_is_refused() {
+    assert!(raised(&fixture(false, false)).is_ok());
+    assert!(matches!(
+        raised(&fixture(false, true)),
+        Err(crate::ShaderError::Unsupported {
+            what: "a geometry ring store to a vertex already emitted",
+            ..
+        })
+    ));
 }

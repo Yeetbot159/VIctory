@@ -392,6 +392,12 @@ pub(crate) fn raise(p: &Program, gs: &GeometryIo) -> Result<Streams, ShaderError
                     if u32::from(off) >= gs.invocation_dwords {
                         return Err(fail(i, "a geometry ring store outside the invocation"));
                     }
+                    // The console's copy VS reads the ring after the GS ends;
+                    // the translation takes each slot's value at its EMIT. A
+                    // slot written after its vertex was emitted would differ.
+                    if u32::from(off) < vertex * gs.vertex_dwords {
+                        return Err(fail(i, "a geometry ring store to a vertex already emitted"));
+                    }
                     ring.insert(u32::from(off), v);
                 }
             }
