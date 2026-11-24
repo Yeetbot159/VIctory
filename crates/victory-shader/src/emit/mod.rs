@@ -733,6 +733,13 @@ pub(crate) fn one_mode_per_row(elements: &mut [container::SigElement]) {
         } else {
             modes.iter().copied().find(|&m| m > 1).unwrap_or(1)
         };
+        // A coercion is legal and invisible: a program that reads its row
+        // with the mode it lost samples differently while the module and the
+        // pipeline both look right. `VICTORY_MODE_COERCION=1` names it.
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_MODE_COERCION").is_some() {
+            eprintln!("mode row {row}: {modes:?} -> {mode}");
+        }
         for e in elements.iter_mut().filter(|e| e.row == Some(row)) {
             e.interp = mode;
         }
