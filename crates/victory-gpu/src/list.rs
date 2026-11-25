@@ -1446,14 +1446,37 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
-/// Depth bounds `(min, max)`.
-/// shortcut: not set on the host list (no host pipeline of ours enables
-/// the test, `pipeline::host`); the first values are logged, so a run
-/// shows whether the title uses the test at all.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        tracing::info!(min, max, "the title sets depth bounds, which the host is not given");
+/// Depth bounds `(min, max)`: the pair the test compares against, set on the
+/// host list. The test itself is the pipeline's (`pipeline::host`: a pipeline
+/// that enables it is made from the stream form, which carries
+/// `DepthBoundsTestEnable`), so without both halves a draw would pass at every
+/// depth.
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        match windows::core::Interface::cast::<
+            windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1,
+        >(&list.list) {
+            Ok(list1) => {
+                // SAFETY: an open list of ours, recorded on this thread.
+                unsafe { list1.OMSetDepthBounds(min, max) };
+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    tracing::info!(min, max, "the title sets depth bounds, forwarded to the host list");
+                }
+            }
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        error = %e,
+                        min,
+                        max,
+                        "the title sets depth bounds, but the host list has no OMSetDepthBounds"
+                    );
+                });
+            }
+        }
     }
 }
 
