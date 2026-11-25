@@ -48,11 +48,18 @@ pub enum Phase {
     Translate,
     /// A whole submission, preparing to copying back.
     Submit,
+    /// Of a submission: the lists' own uploads and finalisation, the
+    /// snapshots shaders' write ranges need, the copies in the card's
+    /// memory, and the queue call with its signal.
+    SubmitLists,
+    SubmitSnapshot,
+    SubmitCard,
+    SubmitQueue,
     /// A queue's `ExecuteCommandLists`, the submission and its loop inside.
     Loop,
 }
 
-const PHASES: usize = 10;
+const PHASES: usize = 14;
 
 static US: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static CALLS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
@@ -107,6 +114,10 @@ pub(crate) fn line(frames: f64, ms: f64) {
     let (shadow, shadow_calls) = per(Phase::Shadow);
     let (translate, translate_calls) = per(Phase::Translate);
     let (submit, submit_calls) = per(Phase::Submit);
+    let (submit_lists, _) = per(Phase::SubmitLists);
+    let (submit_snapshot, _) = per(Phase::SubmitSnapshot);
+    let (submit_card, _) = per(Phase::SubmitCard);
+    let (submit_queue, _) = per(Phase::SubmitQueue);
     let (queue, _) = per(Phase::Loop);
     tracing::info!(
         "where a frame's time goes per frame, of {ms:.1} ms: {queue:.1} ms in the queues' loop, {submit:.1} ms \
@@ -114,7 +125,7 @@ of it submitting ({submit_calls:.1} submissions); beside it on the title's threa
 recording {record_calls:.0} list calls, of it {draw:.1} ms in {draw_calls:.0} draws and dispatches \
 ({bind:.1} ms binding them: {bind_state:.1} ms state, {bind_tables:.1} ms descriptor tables, \
 {bind_views:.1} ms root views and constants; {shadow:.1} ms in {shadow_calls:.0} shadow and \
-address-space lookups); and {translate:.1} ms making {translate_calls:.1} pipelines. These are sums \
+address-space lookups); of the submission: {submit_lists:.1} ms in the lists' uploads and finalisation, {submit_snapshot:.1} ms in snapshots, {submit_card:.1} ms in the card's memory copies, {submit_queue:.1} ms in the queue call and its signal; and {translate:.1} ms making {translate_calls:.1} pipelines.  These are sums \
 over threads: recording and making run beside the loop, so they can exceed the frame's wall clock"
     );
 }
