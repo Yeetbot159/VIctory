@@ -388,15 +388,64 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // Which of the description's first words point at shader bytecode: a
+        // container starts `DXBC` (or `DXIL` inside one), and finding one is
+        // what turns a console description into a pipeline we can make.
+        #[cfg(windows)]
+        let code_at = |w: &[u64]| -> Vec<(&'static str, usize)> {
+            let mut found = Vec::new();
+            for (i, word) in w.iter().take(8).enumerate() {
+                let mut head = [0u8; 16];
+                if *word != 0 && crate::host::read_into(*word as usize as *const u8, &mut head) {
+                    for (magic, at) in [("DXBC", 0usize), ("DXIL", 0), ("SHDR", 0)] {
+                        if &head[at..at + 4] == magic.as_bytes() {
+                            found.push((magic, i));
+                        }
+                    }
+                }
+            }
+            found
+        };
+        #[cfg(not(windows))]
+        let code_at = |_: &[u64]| Vec::<(&'static str, usize)>::new();
+        let wants = if iid_is_pipeline_state(_iid) { "ID3D12PipelineState" } else { "another interface" };
+        let mut deeper = [0u64; 32];
+        #[cfg(windows)]
+        if desc as usize != 0 {
+            let mut bytes = [0u8; 256];
+            if crate::host::read_into(desc as *const u8, &mut bytes) {
+                for (i, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+                    deeper[i] = chunk.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b));
+                }
+            }
+        }
+        let code = code_at(&deeper);
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            wants = wants,
+            description_32 = format_args!("{deeper:x?}"),
+            code = format_args!("{code:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
     E_NOTIMPL
+}
+
+/// `{765A30F3-F624-4C6F-A828-ACE948622445}`: the IID the title asks these two
+/// methods for, read from the title's own `.rdata` at `title+0x1061e06b8`, and
+/// the interface both call sites pass in `r8`.
+const PIPELINE_STATE: Iid = guid(
+    0x765a30f3,
+    0xf624,
+    0x4c6f,
+    [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+);
+
+fn iid_is_pipeline_state(iid: *const Iid) -> bool {
+    object::is(iid, &[PIPELINE_STATE])
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
