@@ -5258,6 +5258,14 @@ impl HostList {
                 batch.reading = None;
             }
             let started = std::time::Instant::now();
+            let kind = match step {
+                Step::Copy(..) | Step::Fill(..) => crate::phase::Phase::SubmitCopy,
+                Step::Refresh(..) => crate::phase::Phase::SubmitShadowRefresh,
+                Step::Run(..) | Step::Host(..) => crate::phase::Phase::SubmitStep,
+                Step::GpuWrite(..) => crate::phase::Phase::SubmitWrite,
+                Step::Texture(..) => crate::phase::Phase::SubmitTexture,
+            };
+            let _step = crate::phase::at(kind);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]

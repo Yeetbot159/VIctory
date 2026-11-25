@@ -52,6 +52,14 @@ pub enum Phase {
     /// snapshots shaders' write ranges need, the copies in the card's
     /// memory, and the queue call with its signal.
     SubmitLists,
+    /// Of the lists' walk: a title-memory copy or fill, a shadow's
+    /// refresh, a host step's work, a write range's snapshot, and a
+    /// texture's refresh.
+    SubmitCopy,
+    SubmitShadowRefresh,
+    SubmitStep,
+    SubmitWrite,
+    SubmitTexture,
     SubmitSnapshot,
     SubmitCard,
     SubmitQueue,
@@ -59,7 +67,7 @@ pub enum Phase {
     Loop,
 }
 
-const PHASES: usize = 14;
+const PHASES: usize = 19;
 
 static US: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static CALLS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
@@ -115,6 +123,11 @@ pub(crate) fn line(frames: f64, ms: f64) {
     let (translate, translate_calls) = per(Phase::Translate);
     let (submit, submit_calls) = per(Phase::Submit);
     let (submit_lists, _) = per(Phase::SubmitLists);
+    let (copy, _) = per(Phase::SubmitCopy);
+    let (shadow_refresh, _) = per(Phase::SubmitShadowRefresh);
+    let (step, _) = per(Phase::SubmitStep);
+    let (write, _) = per(Phase::SubmitWrite);
+    let (texture, _) = per(Phase::SubmitTexture);
     let (submit_snapshot, _) = per(Phase::SubmitSnapshot);
     let (submit_card, _) = per(Phase::SubmitCard);
     let (submit_queue, _) = per(Phase::SubmitQueue);
@@ -125,7 +138,12 @@ of it submitting ({submit_calls:.1} submissions); beside it on the title's threa
 recording {record_calls:.0} list calls, of it {draw:.1} ms in {draw_calls:.0} draws and dispatches \
 ({bind:.1} ms binding them: {bind_state:.1} ms state, {bind_tables:.1} ms descriptor tables, \
 {bind_views:.1} ms root views and constants; {shadow:.1} ms in {shadow_calls:.0} shadow and \
-address-space lookups); of the submission: {submit_lists:.1} ms in the lists' uploads and finalisation, {submit_snapshot:.1} ms in snapshots, {submit_card:.1} ms in the card's memory copies, {submit_queue:.1} ms in the queue call and its signal; and {translate:.1} ms making {translate_calls:.1} pipelines.  These are sums \
+address-space lookups); of the submission: {submit_lists:.1} ms in the lists' walk, of it \
+{copy:.1} ms copying title memory, {shadow_refresh:.1} ms refreshing shadows, {step:.1} ms in host \
+steps, {write:.1} ms snapshotting write ranges, {texture:.1} ms refreshing textures; \
+{submit_snapshot:.1} ms in snapshots, {submit_card:.1} ms in the card's memory copies, \
+{submit_queue:.1} ms in the queue call and its signal; and {translate:.1} ms making \
+{translate_calls:.1} pipelines.  These are sums \
 over threads: recording and making run beside the loop, so they can exceed the frame's wall clock"
     );
 }
