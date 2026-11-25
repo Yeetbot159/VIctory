@@ -5325,15 +5325,17 @@ impl HostList {
                     // span list execution and submission for the whole
                     // submission.
                     if batch.texture_due(staging) {
-                        if lock_each() {
-                            // The old one-acquisition-a-texture path, kept as
-                            // the control the hoist is measured against
-                            // (`VICTORY_TEXTURE_LOCK_EACH=1`).
-                            batch.reading = None;
-                            staging.refresh();
-                        } else {
+                        if hold_for_run() {
+                            // The hoist, kept as the escape it is measured
+                            // against (`VICTORY_TEXTURE_LOCK_EACH=0`): holding
+                            // the lock across a run of refreshes costs three to
+                            // four times what taking it per texture costs
+                            // (5,052-17,947 us a refresh against 623-4,918).
                             let reading = batch.reading();
                             staging.refresh_holding(reading);
+                        } else {
+                            batch.reading = None;
+                            staging.refresh();
                         }
                     }
                     continue;
@@ -5345,12 +5347,19 @@ impl HostList {
     }
 }
 
-/// Whether each texture refresh takes the title-memory read lock for itself
-/// (`VICTORY_TEXTURE_LOCK_EACH=1`): the control that measures what holding it
-/// once a submission is worth, with nothing else changed.
-fn lock_each() -> bool {
+/// Whether the refreshes of a submission hold the title-memory read lock
+/// across the whole run of them, instead of each taking it for itself
+/// (`VICTORY_TEXTURE_LOCK_EACH=0`; off by default).
+///
+/// Per texture is the default because the hold is a pessimization on this
+/// base: measured back to back on one binary, a refresh inside a held run
+/// costs 5,052-17,947 us and one that takes the lock for itself costs
+/// 623-4,918 us, and the frames are 2.6-9.9 s against 1.4-4.0 s. Why the
+/// hold costs more than it saves is not yet explained, which is what the
+/// switch is kept for.
+fn hold_for_run() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOCK_EACH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOCK_EACH").is_some_and(|v| v == "0"))
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
