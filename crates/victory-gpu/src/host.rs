@@ -2223,6 +2223,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Texture(staging) => {
+                    let _refresh = crate::phase::at(crate::phase::Phase::Refresh);
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {

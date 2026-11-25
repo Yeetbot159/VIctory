@@ -56,6 +56,9 @@ pub enum Phase {
     /// refresh, a host step's work, a write range's snapshot, and a
     /// texture's refresh.
     SubmitCopy,
+    /// One texture the walk refreshed: counted, so the refresh time above
+    /// can be read per refresh in the same second.
+    Refresh,
     SubmitShadowRefresh,
     SubmitStep,
     SubmitWrite,
@@ -67,7 +70,7 @@ pub enum Phase {
     Loop,
 }
 
-const PHASES: usize = 19;
+const PHASES: usize = 20;
 
 static US: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static CALLS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
@@ -127,7 +130,12 @@ pub(crate) fn line(frames: f64, ms: f64) {
     let (shadow_refresh, _) = per(Phase::SubmitShadowRefresh);
     let (step, _) = per(Phase::SubmitStep);
     let (write, _) = per(Phase::SubmitWrite);
-    let (texture, _) = per(Phase::SubmitTexture);
+    let (texture, texture_calls) = per(Phase::SubmitTexture);
+    let per_refresh = if texture_calls > 0.0 {
+        texture * 1000.0 / texture_calls
+    } else {
+        0.0
+    };
     let (submit_snapshot, _) = per(Phase::SubmitSnapshot);
     let (submit_card, _) = per(Phase::SubmitCard);
     let (submit_queue, _) = per(Phase::SubmitQueue);
@@ -140,7 +148,7 @@ recording {record_calls:.0} list calls, of it {draw:.1} ms in {draw_calls:.0} dr
 {bind_views:.1} ms root views and constants; {shadow:.1} ms in {shadow_calls:.0} shadow and \
 address-space lookups); of the submission: {submit_lists:.1} ms in the lists' walk, of it \
 {copy:.1} ms copying title memory, {shadow_refresh:.1} ms refreshing shadows, {step:.1} ms in host \
-steps, {write:.1} ms snapshotting write ranges, {texture:.1} ms refreshing textures; \
+steps, {write:.1} ms snapshotting write ranges, {texture:.1} ms refreshing {texture_calls:.0} textures ({per_refresh:.1} us each); \
 {submit_snapshot:.1} ms in snapshots, {submit_card:.1} ms in the card's memory copies, \
 {submit_queue:.1} ms in the queue call and its signal; and {translate:.1} ms making \
 {translate_calls:.1} pipelines.  These are sums \
